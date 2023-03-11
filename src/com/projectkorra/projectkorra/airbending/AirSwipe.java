@@ -3,9 +3,10 @@ package com.projectkorra.projectkorra.airbending;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 
+import com.projectkorra.projectkorra.region.RegionProtection;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.block.Block;
@@ -57,9 +58,10 @@ public class AirSwipe extends AirAbility {
 	private double radius;
 	private double maxChargeFactor;
 	private Location origin;
-	private Random random;
 	private Map<Vector, Location> streams;
 	private ArrayList<Entity> affectedEntities;
+	private Vector prevDirection = null;
+	private Vector bias = null;
 
 	public AirSwipe(final Player player) {
 		this(player, false);
@@ -71,8 +73,13 @@ public class AirSwipe extends AirAbility {
 		if (CoreAbility.hasAbility(player, AirSwipe.class)) {
 			for (final AirSwipe ability : CoreAbility.getAbilities(player, AirSwipe.class)) {
 				if (ability.charging) {
-					ability.launch();
-					ability.charging = false;
+					ability.prevDirection = ability.player.getLocation().getDirection();
+					new BukkitRunnable(){
+						@Override
+						public void run() {
+							ability.chargedLaunch();
+						}
+					}.runTaskLater(ProjectKorra.plugin, 1);
 					return;
 				}
 			}
@@ -91,7 +98,6 @@ public class AirSwipe extends AirAbility {
 		this.range = getConfig().getDouble("Abilities.Air.AirSwipe.Range");
 		this.radius = getConfig().getDouble("Abilities.Air.AirSwipe.Radius");
 		this.maxChargeFactor = getConfig().getDouble("Abilities.Air.AirSwipe.ChargeFactor");
-		this.random = new Random();
 		this.streams = new ConcurrentHashMap<>();
 		this.affectedEntities = new ArrayList<>();
 
@@ -105,16 +111,29 @@ public class AirSwipe extends AirAbility {
 			return;
 		}
 
-		if (!charging) {
-			this.launch();
-		}
-
 		if (this.bPlayer.isAvatarState()) {
 			this.cooldown = getConfig().getLong("Abilities.Avatar.AvatarState.Air.AirSwipe.Cooldown");
 			this.damage = getConfig().getDouble("Abilities.Avatar.AvatarState.Air.AirSwipe.Damage");
 			this.pushFactor = getConfig().getDouble("Abilities.Avatar.AvatarState.Air.AirSwipe.Push");
 			this.range = getConfig().getDouble("Abilities.Avatar.AvatarState.Air.AirSwipe.Range");
 			this.radius = getConfig().getDouble("Abilities.Avatar.AvatarState.Air.AirSwipe.Radius");
+		}
+
+		if (!charging) { // if left click
+			if(player.isSneaking()) {
+				this.prevDirection = player.getLocation().getDirection();
+				final AirSwipe airSwipe = this;
+				new BukkitRunnable() {
+					@Override
+					public void run() { // Uncharged left click with sneak
+						airSwipe.launch();
+						airSwipe.start();
+					}
+				}.runTaskLater(ProjectKorra.plugin, 1);
+				return;
+			} else { // Simple left click
+				this.launch();
+			}
 		}
 
 		this.start();
@@ -155,7 +174,7 @@ public class AirSwipe extends AirAbility {
 						break;
 					}
 				}
-				
+
 				if(!this.streams.containsKey(direction)) {
 					continue;
 				}
@@ -163,10 +182,10 @@ public class AirSwipe extends AirAbility {
 				location = location.clone().add(direction.clone().multiply(this.speed));
 				this.streams.put(direction, location);
 				playAirbendingParticles(location, this.particles, 0.2F, 0.2F, 0);
-				if (this.random.nextInt(4) == 0) {
+				if (ThreadLocalRandom.current().nextInt(4) == 0) {
 					playAirbendingSound(location);
 				}
-				this.affectPeople(location, direction);
+				this.affectPeople(location, bias==null?direction:bias);
 			}
 		}
 		if (this.streams.isEmpty()) {
@@ -233,7 +252,7 @@ public class AirSwipe extends AirAbility {
 			new BukkitRunnable() {
 				@Override
 				public void run() {
-					if (GeneralMethods.isRegionProtectedFromBuild(AirSwipe.this, entity.getLocation())) {
+					if (RegionProtection.isRegionProtected(AirSwipe.this, entity.getLocation())) {
 						return;
 					}
 					if (entity.getEntityId() != AirSwipe.this.player.getEntityId() && entity instanceof LivingEntity) {
@@ -260,11 +279,28 @@ public class AirSwipe extends AirAbility {
 		}
 	}
 
-	private void launch() {
+	private void chargedLaunch() {
+		this.charging = false;
+		double factor = Math.min(this.maxChargeFactor, this.maxChargeFactor * (System.currentTimeMillis() - this.getStartTime()) / this.maxChargeTime);
+		factor = Math.max(1, factor);
+		this.damage *= factor;
+		this.pushFactor *= factor;
+		this.launch();
+	}
+
+	private void launch(){
 		this.bPlayer.addCooldown("AirSwipe", this.cooldown);
 		this.origin = this.player.getEyeLocation();
-		final Vector direction = this.player.getEyeLocation().getDirection().clone();
+		final Vector direction = this.player.getEyeLocation().getDirection();
 		Vector xz = GeneralMethods.getOrthogonalVector(direction, 0, 1);
+		if(prevDirection==null)
+			prevDirection=direction.clone();
+        if(direction.angle(prevDirection)>0){
+            this.bias = GeneralMethods.getDirection(this.origin.clone().add(this.prevDirection), this.origin.clone().add(direction)).normalize();
+            double degree = Math.toDegrees(xz.angle(bias));
+			degree = (bias.getY() < 0 ? 180 + (180 - degree) : degree);
+			xz = GeneralMethods.getOrthogonalVector(direction, degree, 1);
+        }
 		for (double i = -this.arc; i <= this.arc; i += this.arcIncrement) {
 			final double angle = Math.toRadians(i);
 			this.streams.put(direction.clone().multiply(Math.cos(angle))
@@ -292,18 +328,7 @@ public class AirSwipe extends AirAbility {
 			this.advanceSwipe();
 		} else {
 			if (!this.player.isSneaking()) {
-				double factor = 1;
-				if (System.currentTimeMillis() >= this.getStartTime() + this.maxChargeTime) {
-					factor = this.maxChargeFactor;
-				} else {
-					factor = this.maxChargeFactor * (System.currentTimeMillis() - this.getStartTime()) / this.maxChargeTime;
-				}
-
-				this.charging = false;
-				this.launch();
-				factor = Math.max(1, factor);
-				this.damage *= factor;
-				this.pushFactor *= factor;
+				chargedLaunch();
 			} else if (System.currentTimeMillis() >= this.getStartTime() + this.maxChargeTime) {
 				playAirbendingParticles(this.player.getEyeLocation(), this.particles);
 			}
